@@ -27,4 +27,4 @@ GitOps brings modern GitOps principles to Home Assistant, enabling automated con
 
 Works seamlessly with GitHub Actions workflows to trigger deployments on push, with real-time deployment progress streamed back to your CI/CD pipeline.
 
-See the [README](https://github.com/jxnix-labs/homeassistant-gitops) for full documentation and setup instructions.
+See the [README](https://github.com/jxnix-lab/homeassistant-gitops) for full documentation and setup instructions.

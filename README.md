@@ -1,8 +1,8 @@
 # GitOps for Home Assistant
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
-[![GitHub Release](https://img.shields.io/github/release/jxnix-labs/homeassistant-gitops.svg)](https://github.com/jxnix-labs/homeassistant-gitops/releases)
-[![License](https://img.shields.io/github/license/jxnix-labs/homeassistant-gitops.svg)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/release/jxnix-lab/homeassistant-gitops.svg)](https://github.com/jxnix-lab/homeassistant-gitops/releases)
+[![License](https://img.shields.io/github/license/jxnix-lab/homeassistant-gitops.svg)](LICENSE)
 
 Bring modern GitOps principles to Home Assistant! This integration enables automated configuration deployments triggered by Git pushes, with intelligent component reloading, comprehensive deployment tracking, and real-time status updates.
 
@@ -34,7 +34,7 @@ Bring modern GitOps principles to Home Assistant! This integration enables autom
 1. Open HACS in your Home Assistant instance
 2. Click on "Integrations"
 3. Click the three dots menu in the top right and select "Custom repositories"
-4. Add `https://github.com/jxnix-labs/homeassistant-gitops` as an integration repository
+4. Add `https://github.com/jxnix-lab/homeassistant-gitops` as an integration repository
 5. Click "Install" on the GitOps integration
 6. Restart Home Assistant
 
@@ -345,8 +345,8 @@ Test the integration in your development environment:
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/jxnix-labs/homeassistant-gitops/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/jxnix-labs/homeassistant-gitops/discussions)
+- **Issues**: [GitHub Issues](https://github.com/jxnix-lab/homeassistant-gitops/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/jxnix-lab/homeassistant-gitops/discussions)
 
 ## License
 
