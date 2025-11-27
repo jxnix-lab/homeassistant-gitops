@@ -1,0 +1,69 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up GitOps Integration",
+        "description": "Configure GitOps deployment webhook and Infisical secrets management. The webhook secret will be automatically fetched from Infisical or generated if not found.",
+        "data": {
+          "webhook_id": "Webhook ID",
+          "infisical_url": "Infisical Server URL",
+          "infisical_client_id": "Infisical Client ID",
+          "infisical_client_secret": "Infisical Client Secret",
+          "infisical_project_id": "Infisical Project ID",
+          "infisical_environment": "Infisical Environment",
+          "infisical_path": "Infisical Path",
+          "enable_drift_detection": "Enable Drift Detection",
+          "drift_check_interval": "Drift Check Interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Infisical: {error}",
+      "unknown": "An unexpected error occurred: {error}"
+    },
+    "abort": {
+      "already_configured": "GitOps integration is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "GitOps Options",
+        "data": {
+          "enable_drift_detection": "Enable Drift Detection",
+          "drift_check_interval": "Drift Check Interval (seconds)"
+        }
+      }
+    }
+  },
+  "issues": {
+    "git_lock_detected": {
+      "title": "Git Lock File Detected",
+      "description": "A git lock file was detected at `.git/index.lock`. This usually indicates a previous git operation was interrupted (e.g., by a crash). To resolve, you can remove the lock file manually via SSH or the File Editor addon:\n\n```bash\nrm /config/.git/index.lock\n```\n\nAfter removing the lock file, retry the deployment."
+    },
+    "restart_required": {
+      "title": "Home Assistant Restart Required",
+      "description": "Deployment of commit `{commit}` completed successfully, but changes require a Home Assistant restart to take effect.\n\nCommit message: {message}\n\nPlease restart Home Assistant when convenient."
+    },
+    "infisical_connection_failed": {
+      "title": "Infisical Connection Failed",
+      "description": "Failed to connect to Infisical server: {error}\n\nSecrets synchronization is disabled until the connection is restored. Check your Infisical configuration and network connectivity."
+    },
+    "infisical_sync_failed": {
+      "title": "Infisical Secret Sync Failed",
+      "description": "Failed to synchronize secrets from Infisical: {error}\n\nThis may cause issues with configurations that depend on secrets. The integration will retry automatically."
+    },
+    "git_connection_failed": {
+      "title": "Git Repository Connection Failed",
+      "description": "Failed to initialize git repository: {error}\n\nDeployments are disabled until the git repository is accessible."
+    },
+    "deployment_interrupted": {
+      "title": "Previous Deployment Interrupted",
+      "description": "A deployment that started at {timestamp} (commit: {commit}) did not complete, likely due to a Home Assistant crash or restart.\n\nPlease check the system logs and current configuration state. You may need to manually verify the deployment or trigger a new one."
+    },
+    "integration_needs_reload": {
+      "title": "GitOps Integration Updated",
+      "description": "The GitOps integration was updated from commit {old_version} to {new_version}.\n\nTo apply the changes, please reload the integration:\n1. Go to Settings → Devices & Services\n2. Find GitOps integration\n3. Click the three dots menu → Reload\n\nAlternatively, restart Home Assistant to fully reload the integration."
+    }
+  }
+}
