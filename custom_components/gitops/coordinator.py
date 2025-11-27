@@ -553,7 +553,7 @@ class GitOpsCoordinator:
 
         # Pull changes
         await self.hass.async_add_executor_job(
-            self._repo.remotes.origin.pull, "homeassistant"
+            self._repo.remotes.origin.pull
         )
 
         # Get new commit
