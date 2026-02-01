@@ -1,0 +1,7 @@
+deploy:
+  name: Deploy
+  description: Pull latest configuration from Git, sync secrets from Doppler, validate, and reload changed components.
+
+check_updates:
+  name: Check for updates
+  description: Fetch from Git remote and check for available commits.

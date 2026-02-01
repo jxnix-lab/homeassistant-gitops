@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Set up GitOps",
-        "description": "Create a [service token](https://docs.doppler.com/docs/service-tokens) in Doppler scoped to your project/config for secrets access.\n\nThe integration will poll Git for new commits and show them as available updates.",
+        "description": "Enter a Doppler service token scoped to your project and config for secrets access.\n\nThe integration will poll Git for new commits and show them as available updates.",
         "data": {
           "doppler_service_token": "Doppler Service Token",
           "doppler_api_url": "Doppler API URL",
