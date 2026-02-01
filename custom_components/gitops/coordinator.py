@@ -2,40 +2,34 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
-import subprocess
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
 import git
+import yaml
 from aiohttp import web
 from homeassistant.components import webhook
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from infisical_sdk import InfisicalSDKClient
-import yaml
 
 from .const import (
-    CONF_INFISICAL_CLIENT_ID,
-    CONF_INFISICAL_CLIENT_SECRET,
-    CONF_INFISICAL_ENVIRONMENT,
-    CONF_INFISICAL_PATH,
-    CONF_INFISICAL_PROJECT_ID,
-    CONF_INFISICAL_URL,
-    CONF_WEBHOOK_ID,
-    CONF_WEBHOOK_SECRET,
+    CONF_DOPPLER_API_URL,
+    CONF_DOPPLER_SERVICE_TOKEN,
+    DEFAULT_DOPPLER_API_URL,
     DOMAIN,
     RELOAD_PATTERNS,
+    REPAIR_DOPPLER_CONNECTION,
     REPAIR_GIT_CONNECTION,
     REPAIR_GIT_LOCK,
-    REPAIR_INFISICAL_CONNECTION,
     REPAIR_RESTART_REQUIRED,
     RESTART_REQUIRED_PATTERNS,
     STATE_DEPLOYING,
@@ -48,6 +42,23 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+WEBHOOK_NOTIFY = "gitops-notify"
+WEBHOOK_SECRETS_REFRESH = "gitops-secrets-refresh"
+
+
+@dataclass
+class GitState:
+    """Track git remote vs local state."""
+
+    local_sha: str | None = None
+    local_message: str | None = None
+    remote_sha: str | None = None
+    remote_message: str | None = None
+    commits_behind: int = 0
+    update_available: bool = False
+    last_check: datetime | None = None
+    commit_log: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -73,19 +84,42 @@ class GitOpsCoordinator:
         self.config_entry = config_entry
         self._deployment_lock = asyncio.Lock()
         self._deployment_state = DeploymentState()
+        self._git_state = GitState()
         self._repo: git.Repo | None = None
-        self._infisical_client: InfisicalSDKClient | None = None
         self._journal_path = Path("/config/.gitops_journal.json")
-        self._loaded_integration_version: str | None = None
+
+    # ── Properties ──────────────────────────────────────────────────
+
+    @property
+    def git_state(self) -> GitState:
+        """Get current git state."""
+        return self._git_state
+
+    @property
+    def deployment_state(self) -> DeploymentState:
+        """Get current deployment state."""
+        return self._deployment_state
+
+    @property
+    def _doppler_headers(self) -> dict[str, str]:
+        """Get headers for Doppler API requests."""
+        token = self.config_entry.data[CONF_DOPPLER_SERVICE_TOKEN]
+        return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+    @property
+    def _doppler_base_url(self) -> str:
+        """Get Doppler API base URL."""
+        return self.config_entry.data.get(CONF_DOPPLER_API_URL, DEFAULT_DOPPLER_API_URL)
+
+    # ── Setup / Shutdown ────────────────────────────────────────────
 
     async def async_setup(self) -> None:
         """Set up the coordinator."""
         # Initialize git repository
         try:
-            self._repo = await self.hass.async_add_executor_job(
-                git.Repo, "/config"
-            )
+            self._repo = await self.hass.async_add_executor_job(git.Repo, "/config")
             _LOGGER.info("Git repository initialized at /config")
+            await self._update_local_state()
         except Exception as err:
             _LOGGER.error("Failed to initialize git repository: %s", err)
             ir.async_create_issue(
@@ -98,468 +132,216 @@ class GitOpsCoordinator:
                 translation_placeholders={"error": str(err)},
             )
 
-        # Initialize Infisical client
-        await self._setup_infisical()
-
-        # Load secrets on startup
+        # Load secrets from Doppler
         await self._load_secrets()
 
-        # Track current integration version
-        await self._track_integration_version()
-
-        # Register deployment webhook
+        # Register webhooks
         webhook.async_register(
-            self.hass,
-            DOMAIN,
-            "GitOps Deployment",
-            self.config_entry.data[CONF_WEBHOOK_ID],
-            self._handle_deployment_webhook,
+            self.hass, DOMAIN, "GitOps Push Notification",
+            WEBHOOK_NOTIFY, self._handle_notify_webhook,
         )
-        _LOGGER.info(
-            "Deployment webhook registered: %s", self.config_entry.data[CONF_WEBHOOK_ID]
-        )
-
-        # Register secrets refresh webhook (unauthenticated - just triggers a refresh)
         webhook.async_register(
-            self.hass,
-            DOMAIN,
-            "GitOps Secrets Refresh",
-            "gitops-secrets-refresh",
-            self._handle_secrets_webhook,
+            self.hass, DOMAIN, "GitOps Secrets Refresh",
+            WEBHOOK_SECRETS_REFRESH, self._handle_secrets_webhook,
         )
-        _LOGGER.info("Secrets refresh webhook registered: gitops-secrets-refresh")
+        _LOGGER.info("Webhooks registered: %s, %s", WEBHOOK_NOTIFY, WEBHOOK_SECRETS_REFRESH)
 
     async def async_shutdown(self) -> None:
         """Shutdown the coordinator."""
-        # Unregister webhooks
-        webhook.async_unregister(
-            self.hass, self.config_entry.data[CONF_WEBHOOK_ID]
-        )
-        webhook.async_unregister(self.hass, "gitops-secrets-refresh")
+        webhook.async_unregister(self.hass, WEBHOOK_NOTIFY)
+        webhook.async_unregister(self.hass, WEBHOOK_SECRETS_REFRESH)
 
-    async def _setup_infisical(self) -> None:
-        """Set up Infisical client."""
-        try:
-            self._infisical_client = await self.hass.async_add_executor_job(
-                self._create_infisical_client
-            )
-            _LOGGER.info("Infisical client initialized")
-        except Exception as err:
-            _LOGGER.error("Failed to initialize Infisical client: %s", err)
-            ir.async_create_issue(
-                self.hass,
-                DOMAIN,
-                REPAIR_INFISICAL_CONNECTION,
-                is_fixable=True,
-                severity=ir.IssueSeverity.WARNING,
-                translation_key="infisical_connection_failed",
-                translation_placeholders={"error": str(err)},
-            )
+    # ── Git Operations ──────────────────────────────────────────────
 
-    def _create_infisical_client(self) -> InfisicalSDKClient:
-        """Create and authenticate Infisical client."""
-        client = InfisicalSDKClient(
-            host=self.config_entry.data[CONF_INFISICAL_URL]
-        )
-        client.auth.universal_auth.login(
-            client_id=self.config_entry.data[CONF_INFISICAL_CLIENT_ID],
-            client_secret=self.config_entry.data[CONF_INFISICAL_CLIENT_SECRET],
-        )
-        return client
+    async def _update_local_state(self) -> None:
+        """Update local git state from HEAD."""
+        if not self._repo:
+            return
 
-    async def _load_secrets(self) -> None:
-        """Load secrets from Infisical and write to secrets_infisical.yaml."""
-        if not self._infisical_client:
-            _LOGGER.warning("Infisical client not initialized, skipping secret sync")
+        def _read_head():
+            commit = self._repo.head.commit
+            return commit.hexsha[:7], commit.message.strip().split("\n")[0]
+
+        sha, msg = await self.hass.async_add_executor_job(_read_head)
+        self._git_state.local_sha = sha
+        self._git_state.local_message = msg
+
+    async def async_check_for_updates(self) -> None:
+        """Fetch from remote and check for available updates."""
+        if not self._repo:
+            _LOGGER.warning("Git repository not initialized, skipping update check")
             return
 
         try:
-            # Fetch secrets
-            secrets = await self.hass.async_add_executor_job(
-                self._fetch_infisical_secrets
-            )
+            # Fetch from remote
+            await self.hass.async_add_executor_job(self._repo.remotes.origin.fetch)
 
-            # Write to secrets_infisical.yaml
-            await self._write_infisical_secrets_file(secrets)
+            # Compare local HEAD to remote tracking branch
+            def _compare():
+                local = self._repo.head.commit
+                tracking = self._repo.active_branch.tracking_branch()
+                if tracking is None:
+                    _LOGGER.warning("No tracking branch configured")
+                    return
 
-            # Ensure secrets.yaml includes secrets_infisical.yaml
-            await self._ensure_secrets_yaml_includes_infisical()
+                remote = tracking.commit
 
-            _LOGGER.info("Successfully synced %d secrets from Infisical", len(secrets))
+                local_sha = local.hexsha[:7]
+                remote_sha = remote.hexsha[:7]
+                remote_msg = remote.message.strip().split("\n")[0]
 
-        except Exception as err:
-            _LOGGER.error("Failed to load secrets from Infisical: %s", err)
-            ir.async_create_issue(
-                self.hass,
-                DOMAIN,
-                REPAIR_INFISICAL_CONNECTION,
-                is_fixable=True,
-                severity=ir.IssueSeverity.WARNING,
-                translation_key="infisical_sync_failed",
-                translation_placeholders={"error": str(err)},
-            )
+                # Count commits behind
+                behind = list(self._repo.iter_commits(f"{local.hexsha}..{remote.hexsha}"))
 
-    def _fetch_infisical_secrets(self) -> list[dict[str, str]]:
-        """Fetch secrets from Infisical."""
-        response = self._infisical_client.secrets.list_secrets(
-            project_id=self.config_entry.data[CONF_INFISICAL_PROJECT_ID],
-            environment_slug=self.config_entry.data[CONF_INFISICAL_ENVIRONMENT],
-            secret_path=self.config_entry.data[CONF_INFISICAL_PATH],
-        )
-        secrets = response.secrets if hasattr(response, 'secrets') else []
-        return [{"name": s.secretKey, "value": s.secretValue} for s in secrets]
+                # Build commit log
+                commit_log = []
+                for c in behind[:20]:  # Cap at 20
+                    commit_log.append({
+                        "sha": c.hexsha[:7],
+                        "message": c.message.strip().split("\n")[0],
+                        "author": str(c.author),
+                        "timestamp": datetime.fromtimestamp(
+                            c.committed_date, tz=UTC
+                        ).isoformat(),
+                    })
 
-    async def _write_infisical_secrets_file(
-        self, secrets: list[dict[str, str]]
-    ) -> None:
-        """Write Infisical secrets to dedicated YAML file."""
-        secrets_path = Path("/config/secrets_infisical.yaml")
+                return {
+                    "local_sha": local_sha,
+                    "remote_sha": remote_sha,
+                    "remote_message": remote_msg,
+                    "commits_behind": len(behind),
+                    "commit_log": commit_log,
+                }
 
-        # Build YAML content
-        content = "# Managed by GitOps Integration - DO NOT EDIT MANUALLY\n"
-        content += f"# Synced from Infisical at {datetime.now(UTC).isoformat()}\n"
-        content += f"# Source: {self.config_entry.data[CONF_INFISICAL_PATH]} path in {self.config_entry.data[CONF_INFISICAL_ENVIRONMENT]} environment\n\n"
+            result = await self.hass.async_add_executor_job(_compare)
+            if result is None:
+                return
 
-        # Add each secret
-        secrets_dict = {s["name"]: s["value"] for s in secrets}
-        content += yaml.safe_dump(secrets_dict, default_flow_style=False)
+            self._git_state.local_sha = result["local_sha"]
+            self._git_state.remote_sha = result["remote_sha"]
+            self._git_state.remote_message = result["remote_message"]
+            self._git_state.commits_behind = result["commits_behind"]
+            self._git_state.commit_log = result["commit_log"]
+            self._git_state.update_available = result["commits_behind"] > 0
+            self._git_state.last_check = datetime.now(UTC)
 
-        # Atomic write (write to temp file, then rename)
-        temp_path = secrets_path.with_suffix(".tmp")
-        await self.hass.async_add_executor_job(temp_path.write_text, content)
-        await self.hass.async_add_executor_job(temp_path.rename, secrets_path)
-
-        _LOGGER.debug("Wrote secrets to %s", secrets_path)
-
-    async def _ensure_secrets_yaml_includes_infisical(self) -> None:
-        """Add include directive to secrets.yaml if not present."""
-        secrets_yaml = Path("/config/secrets.yaml")
-        include_line = "<<: !include secrets_infisical.yaml\n"
-
-        if not await self.hass.async_add_executor_job(secrets_yaml.exists):
-            # Create new secrets.yaml with include
-            content = (
-                "# Infisical secrets (managed by GitOps integration)\n"
-                + include_line
-                + "\n# Your manual secrets here\n"
-            )
-            await self.hass.async_add_executor_job(secrets_yaml.write_text, content)
-            _LOGGER.info("Created secrets.yaml with Infisical include")
-        else:
-            # Check if include already present
-            content = await self.hass.async_add_executor_job(secrets_yaml.read_text)
-            if "secrets_infisical.yaml" not in content:
-                # Prepend include to existing file
-                new_content = (
-                    "# Infisical secrets (managed by GitOps integration)\n"
-                    + include_line
-                    + "\n# Existing secrets\n"
-                    + content
+            if self._git_state.update_available:
+                _LOGGER.info(
+                    "Update available: %d commit(s) behind (%s → %s)",
+                    result["commits_behind"],
+                    result["local_sha"],
+                    result["remote_sha"],
                 )
-                await self.hass.async_add_executor_job(
-                    secrets_yaml.write_text, new_content
-                )
-                _LOGGER.info("Added Infisical include to existing secrets.yaml")
+            else:
+                _LOGGER.debug("Up to date at %s", result["local_sha"])
 
-    async def _handle_secrets_webhook(
-        self,
-        hass: HomeAssistant,
-        webhook_id: str,
-        request: web.Request,
-    ) -> web.Response:
-        """Handle incoming webhook from Infisical for secrets refresh."""
-        _LOGGER.info("Secrets refresh webhook triggered, reloading secrets from Infisical")
+            # Clear git connection issues on success
+            ir.async_delete_issue(self.hass, DOMAIN, REPAIR_GIT_CONNECTION)
 
-        # Trigger secrets reload in background
-        asyncio.create_task(self._load_secrets())
-
-        return web.Response(status=202, text="Secrets refresh triggered")
-
-    async def _handle_deployment_webhook(
-        self,
-        hass: HomeAssistant,
-        webhook_id: str,
-        request: web.Request,
-    ) -> web.Response:
-        """Handle incoming webhook from GitHub Actions."""
-        # Verify webhook secret
-        signature = request.headers.get("X-Hub-Signature-256")
-        if not signature:
-            _LOGGER.warning("Webhook received without signature")
-            return web.Response(status=401, text="Missing signature")
-
-        body = await request.read()
-        expected_signature = (
-            "sha256="
-            + hmac.new(
-                self.config_entry.data[CONF_WEBHOOK_SECRET].encode(),
-                body,
-                hashlib.sha256,
-            ).hexdigest()
-        )
-
-        if not hmac.compare_digest(signature, expected_signature):
-            _LOGGER.warning(
-                "Webhook signature verification failed. Received: %s, Expected: %s, Body length: %d",
-                signature,
-                expected_signature,
-                len(body),
-            )
-            return web.Response(status=401, text="Invalid signature")
-
-        # Parse payload from body (already read for signature verification)
-        try:
-            import json
-            payload = json.loads(body.decode())
         except Exception as err:
-            _LOGGER.error("Failed to parse webhook payload: %s", err)
-            return web.Response(status=400, text="Invalid JSON")
+            _LOGGER.error("Failed to check for updates: %s", err)
 
-        # Execute deployment and stream progress via SSE
-        response = web.StreamResponse()
-        response.headers["Content-Type"] = "text/event-stream"
-        response.headers["Cache-Control"] = "no-cache"
-        response.headers["Connection"] = "keep-alive"
-        await response.prepare(request)
+        finally:
+            async_dispatcher_send(self.hass, f"{DOMAIN}_update")
 
-        try:
-            # Stream deployment progress
-            async for event in self._deploy_with_progress(payload):
-                await response.write(f"data: {event}\n\n".encode())
-
-            await response.write_eof()
-            return response
-        except Exception as err:
-            _LOGGER.error("Deployment streaming failed: %s", err)
-            await response.write(f"data: {{\"status\":\"error\",\"error\":\"{str(err)}\"}}\n\n".encode())
-            await response.write_eof()
-            return response
-
-    async def _deploy_with_progress(self, payload: dict[str, Any]):
-        """Execute deployment and yield progress updates as JSON."""
-        import json
+    async def async_deploy(self) -> None:
+        """Pull latest commits, sync secrets, validate, and reload."""
+        if not self._repo:
+            raise RuntimeError("Git repository not initialized")
 
         async with self._deployment_lock:
-            self._deployment_state.status = STATE_DEPLOYING
-            self._deployment_state.timestamp = datetime.now(UTC)
-            self._deployment_state.error = None
-
-            yield json.dumps({"status": "started", "message": "Deployment started"})
-
-            # Write deployment journal
-            await self._write_journal("started", payload)
+            self._deployment_state = DeploymentState(
+                status=STATE_DEPLOYING,
+                timestamp=datetime.now(UTC),
+            )
+            async_dispatcher_send(self.hass, f"{DOMAIN}_update")
 
             try:
                 # Check for git lock file
                 lock_file = Path("/config/.git/index.lock")
                 if await self.hass.async_add_executor_job(lock_file.exists):
-                    error_msg = "Git lock file detected"
-                    _LOGGER.error(error_msg)
                     ir.async_create_issue(
-                        self.hass,
-                        DOMAIN,
-                        REPAIR_GIT_LOCK,
-                        is_fixable=True,
-                        severity=ir.IssueSeverity.ERROR,
+                        self.hass, DOMAIN, REPAIR_GIT_LOCK,
+                        is_fixable=True, severity=ir.IssueSeverity.ERROR,
                         translation_key="git_lock_detected",
                     )
-                    self._deployment_state.status = STATE_FAILED
-                    self._deployment_state.error = error_msg
-                    await self._write_journal("failed", payload, error="git_lock")
-                    yield json.dumps({"status": "failed", "error": error_msg})
-                    return
+                    raise RuntimeError("Git lock file detected — remove .git/index.lock")
 
                 # Pull latest changes
-                yield json.dumps({"status": "pulling", "message": "Pulling latest changes from git"})
-                _LOGGER.info("Pulling latest changes from git")
+                _LOGGER.info("Pulling latest changes")
                 changed_files = await self._git_pull()
                 self._deployment_state.changed_files = changed_files
 
-                # Get commit info
-                commit = await self.hass.async_add_executor_job(
-                    lambda: self._repo.head.commit
-                )
-                self._deployment_state.commit_sha = commit.hexsha[:7]
-                self._deployment_state.commit_message = commit.message.strip()
+                # Update commit info
+                await self._update_local_state()
+                self._deployment_state.commit_sha = self._git_state.local_sha
+                self._deployment_state.commit_message = self._git_state.local_message
 
-                yield json.dumps({
-                    "status": "pulled",
-                    "commit_sha": self._deployment_state.commit_sha,
-                    "commit_message": self._deployment_state.commit_message,
-                    "changed_files": changed_files
-                })
+                # Sync secrets from Doppler (config may reference new secrets)
+                _LOGGER.info("Syncing secrets from Doppler")
+                await self._load_secrets()
 
                 # Validate configuration
                 self._deployment_state.status = STATE_VALIDATING
-                yield json.dumps({"status": "validating", "message": "Validating Home Assistant configuration"})
-                _LOGGER.info("Validating Home Assistant configuration")
+                async_dispatcher_send(self.hass, f"{DOMAIN}_update")
+                _LOGGER.info("Validating configuration")
                 await self._validate_config()
-                yield json.dumps({"status": "validated", "message": "Configuration is valid"})
 
-                # Determine what needs to reload
+                # Determine reloads
                 self._deployment_state.status = STATE_RELOADING
-                reload_domains = await self._determine_reload_domains(changed_files)
-                self._deployment_state.reload_domains = reload_domains
-
-                # Check if restart required
-                restart_required = await self._check_restart_required(changed_files)
-                self._deployment_state.restart_required = restart_required
-
-                if restart_required:
-                    _LOGGER.warning("Restart required for changes to take effect")
-                    ir.async_create_issue(
-                        self.hass,
-                        DOMAIN,
-                        REPAIR_RESTART_REQUIRED,
-                        is_fixable=False,
-                        severity=ir.IssueSeverity.WARNING,
-                        translation_key="restart_required",
-                        translation_placeholders={
-                            "commit": self._deployment_state.commit_sha,
-                            "message": self._deployment_state.commit_message,
-                        },
-                    )
-                    self._deployment_state.status = STATE_RESTART_REQUIRED
-                    yield json.dumps({
-                        "status": "restart_required",
-                        "message": "Restart required for changes to take effect",
-                        "commit_sha": self._deployment_state.commit_sha,
-                        "commit_message": self._deployment_state.commit_message
-                    })
-                else:
-                    # Execute reloads
-                    yield json.dumps({"status": "reloading", "message": f"Reloading domains: {', '.join(reload_domains)}"})
-                    _LOGGER.info("Reloading domains: %s", reload_domains)
-                    await self._execute_reloads(reload_domains)
-                    self._deployment_state.status = STATE_SUCCESS
-                    yield json.dumps({
-                        "status": "success",
-                        "message": "Deployment completed successfully",
-                        "reloaded_domains": reload_domains
-                    })
-
-                await self._write_journal("success", payload)
-                _LOGGER.info("Deployment completed successfully")
-
-                # Check if integration was updated
-                await self._check_integration_update()
-
-            except Exception as err:
-                _LOGGER.error("Deployment failed: %s", err, exc_info=True)
-                self._deployment_state.status = STATE_FAILED
-                self._deployment_state.error = str(err)
-                await self._write_journal("failed", payload, error=str(err))
-                yield json.dumps({"status": "failed", "error": str(err)})
-
-            finally:
-                # Update sensors
                 async_dispatcher_send(self.hass, f"{DOMAIN}_update")
 
-    async def _deploy(self, payload: dict[str, Any]) -> None:
-        """Execute deployment."""
-        async with self._deployment_lock:
-            self._deployment_state.status = STATE_DEPLOYING
-            self._deployment_state.timestamp = datetime.now(UTC)
-            self._deployment_state.error = None
-
-            # Write deployment journal
-            await self._write_journal("started", payload)
-
-            try:
-                # Check for git lock file
-                lock_file = Path("/config/.git/index.lock")
-                if await self.hass.async_add_executor_job(lock_file.exists):
-                    _LOGGER.error("Git lock file exists, creating repair issue")
-                    ir.async_create_issue(
-                        self.hass,
-                        DOMAIN,
-                        REPAIR_GIT_LOCK,
-                        is_fixable=True,
-                        severity=ir.IssueSeverity.ERROR,
-                        translation_key="git_lock_detected",
-                    )
-                    self._deployment_state.status = STATE_FAILED
-                    self._deployment_state.error = "Git lock file detected"
-                    await self._write_journal("failed", payload, error="git_lock")
-                    return
-
-                # Pull latest changes
-                _LOGGER.info("Pulling latest changes from git")
-                changed_files = await self._git_pull()
-                self._deployment_state.changed_files = changed_files
-
-                # Get commit info
-                commit = await self.hass.async_add_executor_job(
-                    lambda: self._repo.head.commit
-                )
-                self._deployment_state.commit_sha = commit.hexsha[:7]
-                self._deployment_state.commit_message = commit.message.strip()
-
-                # Validate configuration
-                self._deployment_state.status = STATE_VALIDATING
-                _LOGGER.info("Validating Home Assistant configuration")
-                await self._validate_config()
-
-                # Determine what needs to reload
-                self._deployment_state.status = STATE_RELOADING
-                reload_domains = await self._determine_reload_domains(changed_files)
+                reload_domains = self._determine_reload_domains(changed_files)
                 self._deployment_state.reload_domains = reload_domains
 
-                # Check if restart required
-                restart_required = await self._check_restart_required(changed_files)
+                restart_required = self._check_restart_required(changed_files)
                 self._deployment_state.restart_required = restart_required
 
                 if restart_required:
                     _LOGGER.warning("Restart required for changes to take effect")
                     ir.async_create_issue(
-                        self.hass,
-                        DOMAIN,
-                        REPAIR_RESTART_REQUIRED,
-                        is_fixable=False,
-                        severity=ir.IssueSeverity.WARNING,
+                        self.hass, DOMAIN, REPAIR_RESTART_REQUIRED,
+                        is_fixable=False, severity=ir.IssueSeverity.WARNING,
                         translation_key="restart_required",
                         translation_placeholders={
-                            "commit": self._deployment_state.commit_sha,
-                            "message": self._deployment_state.commit_message,
+                            "commit": self._deployment_state.commit_sha or "",
+                            "message": self._deployment_state.commit_message or "",
                         },
                     )
                     self._deployment_state.status = STATE_RESTART_REQUIRED
                 else:
-                    # Execute reloads
                     _LOGGER.info("Reloading domains: %s", reload_domains)
                     await self._execute_reloads(reload_domains)
                     self._deployment_state.status = STATE_SUCCESS
 
-                await self._write_journal("success", payload)
-                _LOGGER.info("Deployment completed successfully")
+                _LOGGER.info(
+                    "Deployment completed: %s (%s)",
+                    self._deployment_state.commit_sha,
+                    self._deployment_state.status,
+                )
 
-                # Check if integration was updated
-                await self._check_integration_update()
+                # Reset git state — we're up to date now
+                self._git_state.update_available = False
+                self._git_state.commits_behind = 0
+                self._git_state.commit_log = []
+                self._git_state.remote_sha = self._git_state.local_sha
 
             except Exception as err:
                 _LOGGER.error("Deployment failed: %s", err, exc_info=True)
                 self._deployment_state.status = STATE_FAILED
                 self._deployment_state.error = str(err)
-                await self._write_journal("failed", payload, error=str(err))
 
             finally:
-                # Update sensors
                 async_dispatcher_send(self.hass, f"{DOMAIN}_update")
 
     async def _git_pull(self) -> list[str]:
         """Pull latest changes and return list of changed files."""
-        # Get current commit
         old_commit = self._repo.head.commit
 
-        # Pull changes
-        await self.hass.async_add_executor_job(
-            self._repo.remotes.origin.pull
-        )
+        await self.hass.async_add_executor_job(self._repo.remotes.origin.pull)
 
-        # Get new commit
         new_commit = self._repo.head.commit
 
-        # Get diff
         if old_commit != new_commit:
             diff = old_commit.diff(new_commit)
             changed_files = [item.a_path for item in diff]
@@ -570,44 +352,31 @@ class GitOpsCoordinator:
 
     async def _validate_config(self) -> None:
         """Validate Home Assistant configuration."""
-        # Use Home Assistant's config check service
         try:
             await self.hass.services.async_call(
                 "homeassistant", "check_config", blocking=True
             )
-            _LOGGER.info("Configuration validation passed")
         except Exception as err:
-            _LOGGER.error("Configuration validation failed: %s", err)
             raise RuntimeError(f"Config validation failed: {err}") from err
 
-    async def _determine_reload_domains(
-        self, changed_files: list[str]
-    ) -> list[str]:
+    def _determine_reload_domains(self, changed_files: list[str]) -> list[str]:
         """Determine which domains need to be reloaded."""
         domains = set()
-
         for domain, patterns in RELOAD_PATTERNS.items():
             for pattern in patterns:
                 for changed_file in changed_files:
-                    if self._match_pattern(changed_file, pattern):
+                    if fnmatch(changed_file, pattern):
                         domains.add(domain)
                         break
-
         return list(domains)
 
-    async def _check_restart_required(self, changed_files: list[str]) -> bool:
+    def _check_restart_required(self, changed_files: list[str]) -> bool:
         """Check if any changed files require a full restart."""
         for pattern in RESTART_REQUIRED_PATTERNS:
             for changed_file in changed_files:
-                if self._match_pattern(changed_file, pattern):
+                if fnmatch(changed_file, pattern):
                     return True
         return False
-
-    def _match_pattern(self, filepath: str, pattern: str) -> bool:
-        """Match file path against pattern (supports wildcards)."""
-        from fnmatch import fnmatch
-
-        return fnmatch(filepath, pattern)
 
     async def _execute_reloads(self, domains: list[str]) -> None:
         """Execute reload for each domain."""
@@ -621,28 +390,116 @@ class GitOpsCoordinator:
                 _LOGGER.error("Failed to reload %s: %s", domain, err)
                 raise
 
-    async def _write_journal(
-        self,
-        status: str,
-        payload: dict[str, Any],
-        error: str | None = None,
-    ) -> None:
-        """Write deployment journal for crash recovery."""
-        journal_data = {
-            "status": status,
-            "timestamp": datetime.now(UTC).isoformat(),
-            "commit_sha": self._deployment_state.commit_sha,
-            "commit_message": self._deployment_state.commit_message,
-            "payload": payload,
-            "error": error,
-        }
+    # ── Doppler Secrets ─────────────────────────────────────────────
 
-        await self.hass.async_add_executor_job(
-            self._journal_path.write_text, json.dumps(journal_data, indent=2)
-        )
+    async def _fetch_doppler_secrets(self) -> dict[str, str]:
+        """Fetch secrets from Doppler."""
+        session = async_get_clientsession(self.hass)
+        url = f"{self._doppler_base_url}/v3/configs/config/secrets/download"
+
+        async with session.get(
+            url, headers=self._doppler_headers, params={"format": "json"}
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"Doppler API error (HTTP {resp.status}): {text}")
+            data = await resp.json()
+            return {k: v for k, v in data.items() if not k.startswith("DOPPLER_")}
+
+    async def _load_secrets(self) -> None:
+        """Load secrets from Doppler and write to secrets_doppler.yaml."""
+        try:
+            secrets = await self._fetch_doppler_secrets()
+            await self._write_secrets_file(secrets)
+            await self._ensure_secrets_yaml_includes()
+            _LOGGER.info("Synced %d secrets from Doppler", len(secrets))
+            ir.async_delete_issue(self.hass, DOMAIN, REPAIR_DOPPLER_CONNECTION)
+        except Exception as err:
+            _LOGGER.error("Failed to load secrets from Doppler: %s", err)
+            ir.async_create_issue(
+                self.hass, DOMAIN, REPAIR_DOPPLER_CONNECTION,
+                is_fixable=True, severity=ir.IssueSeverity.WARNING,
+                translation_key="doppler_connection_failed",
+                translation_placeholders={"error": str(err)},
+            )
+
+    async def _write_secrets_file(self, secrets: dict[str, str]) -> None:
+        """Write secrets to secrets_doppler.yaml (atomic)."""
+        secrets_path = Path("/config/secrets_doppler.yaml")
+
+        content = "# Managed by GitOps Integration - DO NOT EDIT MANUALLY\n"
+        content += f"# Synced from Doppler at {datetime.now(UTC).isoformat()}\n\n"
+        content += yaml.safe_dump(secrets, default_flow_style=False)
+
+        temp_path = secrets_path.with_suffix(".tmp")
+        await self.hass.async_add_executor_job(temp_path.write_text, content)
+        await self.hass.async_add_executor_job(temp_path.rename, secrets_path)
+
+    async def _ensure_secrets_yaml_includes(self) -> None:
+        """Ensure secrets.yaml includes secrets_doppler.yaml."""
+        secrets_yaml = Path("/config/secrets.yaml")
+        include_line = "<<: !include secrets_doppler.yaml\n"
+
+        if not await self.hass.async_add_executor_job(secrets_yaml.exists):
+            content = (
+                "# Doppler secrets (managed by GitOps integration)\n"
+                + include_line
+                + "\n# Your manual secrets here\n"
+            )
+            await self.hass.async_add_executor_job(secrets_yaml.write_text, content)
+            _LOGGER.info("Created secrets.yaml with Doppler include")
+        else:
+            content = await self.hass.async_add_executor_job(secrets_yaml.read_text)
+            if "secrets_doppler.yaml" not in content:
+                if "secrets_infisical.yaml" in content:
+                    new_content = content.replace(
+                        "secrets_infisical.yaml", "secrets_doppler.yaml"
+                    )
+                    _LOGGER.info("Migrated secrets.yaml include from Infisical to Doppler")
+                else:
+                    new_content = (
+                        "# Doppler secrets (managed by GitOps integration)\n"
+                        + include_line + "\n" + content
+                    )
+                    _LOGGER.info("Added Doppler include to existing secrets.yaml")
+                await self.hass.async_add_executor_job(
+                    secrets_yaml.write_text, new_content
+                )
+
+    # ── Webhooks ────────────────────────────────────────────────────
+
+    async def _handle_notify_webhook(
+        self, hass: HomeAssistant, webhook_id: str, request: web.Request,
+    ) -> web.Response:
+        """Handle push notification — triggers an update check."""
+        _LOGGER.info("Push notification received, checking for updates")
+        asyncio.create_task(self.async_check_for_updates())
+        return web.Response(status=200, text="OK")
+
+    async def _handle_secrets_webhook(
+        self, hass: HomeAssistant, webhook_id: str, request: web.Request,
+    ) -> web.Response:
+        """Handle secrets refresh webhook."""
+        _LOGGER.info("Secrets refresh triggered via webhook")
+        asyncio.create_task(self._load_secrets())
+        return web.Response(status=202, text="Secrets refresh triggered")
+
+    # ── Drift Detection ─────────────────────────────────────────────
+
+    async def check_drift(self) -> None:
+        """Check for uncommitted local changes."""
+        if not self._repo:
+            return
+        try:
+            if await self.hass.async_add_executor_job(self._repo.is_dirty):
+                _LOGGER.info("Configuration drift detected (uncommitted changes)")
+        except Exception as err:
+            _LOGGER.error("Failed to check drift: %s", err)
+
+    # ── Journal (crash recovery) ────────────────────────────────────
 
     async def check_deployment_journal(self) -> None:
-        """Check deployment journal on startup for crash recovery."""
+        """Check for interrupted deployments on startup."""
         if not await self.hass.async_add_executor_job(self._journal_path.exists):
             return
 
@@ -650,115 +507,40 @@ class GitOpsCoordinator:
             journal_data = json.loads(
                 await self.hass.async_add_executor_job(self._journal_path.read_text)
             )
-
             if journal_data.get("status") == "started":
                 _LOGGER.warning(
                     "Detected incomplete deployment from %s",
                     journal_data.get("timestamp"),
                 )
                 ir.async_create_issue(
-                    self.hass,
-                    DOMAIN,
-                    "deployment_interrupted",
-                    is_fixable=False,
-                    severity=ir.IssueSeverity.WARNING,
+                    self.hass, DOMAIN, "deployment_interrupted",
+                    is_fixable=False, severity=ir.IssueSeverity.WARNING,
                     translation_key="deployment_interrupted",
                     translation_placeholders={
                         "timestamp": journal_data.get("timestamp", "unknown"),
                         "commit": journal_data.get("commit_sha", "unknown"),
                     },
                 )
-
         except Exception as err:
             _LOGGER.error("Failed to read deployment journal: %s", err)
 
-    async def check_drift(self) -> None:
-        """Check for configuration drift."""
+    # ── Helpers ──────────────────────────────────────────────────────
+
+    def get_repo_url(self) -> str | None:
+        """Get HTTPS URL for the repository (for compare links)."""
         if not self._repo:
-            return
-
+            return None
         try:
-            # Check for uncommitted changes
-            if await self.hass.async_add_executor_job(self._repo.is_dirty):
-                _LOGGER.info("Detected configuration drift")
-                # Trigger drift detection workflow
-                # This would create a PR via GitHub API
-                # Implementation TBD based on requirements
-
-        except Exception as err:
-            _LOGGER.error("Failed to check drift: %s", err)
-
-    async def _track_integration_version(self) -> None:
-        """Track the current integration code SHA."""
-        if not self._repo:
-            return
-
-        try:
-            # Get the git SHA of the custom_components/gitops directory
-            integration_sha = await self.hass.async_add_executor_job(
-                self._repo.git.log,
-                "-1",
-                "--format=%H",
-                "--",
-                "custom_components/gitops/"
-            )
-            self._loaded_integration_version = integration_sha.strip()
-            _LOGGER.info("Tracking integration code SHA: %s", self._loaded_integration_version[:7])
-        except Exception as err:
-            _LOGGER.error("Failed to track integration version: %s", err)
-
-    async def _check_integration_update(self) -> None:
-        """Check if integration files were updated and need reload."""
-        if not self._repo or not self._loaded_integration_version:
-            return
-
-        try:
-            # Check if custom_components/gitops files changed
-            diff = self._repo.git.diff("HEAD~1", "HEAD", "--name-only")
-            changed_files = diff.split("\n") if diff else []
-
-            integration_files_changed = any(
-                f.startswith("custom_components/gitops/") for f in changed_files
-            )
-
-            if not integration_files_changed:
-                return
-
-            # Get current integration SHA
-            current_sha = await self.hass.async_add_executor_job(
-                self._repo.git.log,
-                "-1",
-                "--format=%H",
-                "--",
-                "custom_components/gitops/"
-            )
-            current_sha = current_sha.strip()
-
-            # If SHA changed, create repair issue
-            if current_sha != self._loaded_integration_version:
-                _LOGGER.warning(
-                    "Integration updated from %s to %s, reload recommended",
-                    self._loaded_integration_version[:7],
-                    current_sha[:7],
-                )
-
-                ir.async_create_issue(
-                    self.hass,
-                    DOMAIN,
-                    "integration_needs_reload",
-                    is_fixable=False,
-                    severity=ir.IssueSeverity.WARNING,
-                    translation_key="integration_needs_reload",
-                    translation_placeholders={
-                        "old_version": self._loaded_integration_version[:7],
-                        "new_version": current_sha[:7],
-                    },
-                )
-
-        except Exception as err:
-            _LOGGER.error("Failed to check integration update: %s", err)
-
-    @property
-    def deployment_state(self) -> DeploymentState:
-        """Get current deployment state."""
-        return self._deployment_state
+            url = self._repo.remotes.origin.url
+            # git@github.com:user/repo.git → https://github.com/user/repo
+            if url.startswith("git@"):
+                match = re.match(r"git@([^:]+):(.+?)(?:\.git)?$", url)
+                if match:
+                    return f"https://{match.group(1)}/{match.group(2)}"
+            if url.endswith(".git"):
+                url = url[:-4]
+            if url.startswith("https://"):
+                return url
+        except Exception:
+            pass
+        return None

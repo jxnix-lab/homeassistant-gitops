@@ -24,12 +24,10 @@ async def async_setup_entry(
     """Set up GitOps sensors."""
     coordinator: GitOpsCoordinator = hass.data[DOMAIN][config_entry.entry_id]
 
-    entities = [
+    async_add_entities([
         GitOpsDeploymentStatusSensor(coordinator),
         GitOpsCurrentCommitSensor(coordinator),
-    ]
-
-    async_add_entities(entities)
+    ])
 
 
 class GitOpsBaseSensor(SensorEntity):
@@ -51,14 +49,12 @@ class GitOpsBaseSensor(SensorEntity):
         """Register callbacks."""
         self.async_on_remove(
             async_dispatcher_connect(
-                self.hass,
-                f"{DOMAIN}_update",
-                self._handle_coordinator_update,
+                self.hass, f"{DOMAIN}_update", self._handle_update,
             )
         )
 
     @callback
-    def _handle_coordinator_update(self) -> None:
+    def _handle_update(self) -> None:
         """Handle updated data from the coordinator."""
         self.async_write_ha_state()
 
@@ -68,7 +64,7 @@ class GitOpsDeploymentStatusSensor(GitOpsBaseSensor):
 
     _attr_name = "Deployment Status"
     _attr_unique_id = "gitops_deployment_status"
-    _attr_icon = "mdi:git"
+    _attr_icon = "mdi:rocket-launch"
 
     @property
     def native_value(self) -> str:
@@ -76,7 +72,7 @@ class GitOpsDeploymentStatusSensor(GitOpsBaseSensor):
         return self.coordinator.deployment_state.status
 
     @property
-    def extra_state_attributes(self) -> dict[str, any]:
+    def extra_state_attributes(self) -> dict:
         """Return additional attributes."""
         state = self.coordinator.deployment_state
         attrs = {
@@ -87,10 +83,8 @@ class GitOpsDeploymentStatusSensor(GitOpsBaseSensor):
             "reload_domains": state.reload_domains or [],
             "restart_required": state.restart_required,
         }
-
         if state.error:
             attrs["error"] = state.error
-
         return attrs
 
 
@@ -103,23 +97,17 @@ class GitOpsCurrentCommitSensor(GitOpsBaseSensor):
 
     @property
     def native_value(self) -> str | None:
-        """Return the state."""
-        if self.coordinator._repo:
-            return self.coordinator._repo.head.commit.hexsha[:7]
-        return None
+        """Return the current commit SHA."""
+        return self.coordinator.git_state.local_sha
 
     @property
-    def extra_state_attributes(self) -> dict[str, any]:
+    def extra_state_attributes(self) -> dict:
         """Return additional attributes."""
-        if not self.coordinator._repo:
-            return {}
-
-        commit = self.coordinator._repo.head.commit
+        git = self.coordinator.git_state
         return {
-            "full_sha": commit.hexsha,
-            "message": commit.message.strip(),
-            "author": str(commit.author),
-            "timestamp": datetime.fromtimestamp(commit.committed_date).isoformat(),
+            "message": git.local_message,
+            "remote_sha": git.remote_sha,
+            "commits_behind": git.commits_behind,
+            "update_available": git.update_available,
+            "last_check": git.last_check.isoformat() if git.last_check else None,
         }
-
-
