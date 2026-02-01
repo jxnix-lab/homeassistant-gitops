@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+from datetime import datetime
 
 from homeassistant.components.update import UpdateEntity, UpdateEntityFeature
 from homeassistant.config_entries import ConfigEntry
@@ -23,20 +23,18 @@ async def async_setup_entry(
 ) -> None:
     """Set up GitOps update entity."""
     coordinator: GitOpsCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+    async_add_entities([GitOpsConfigUpdate(coordinator)])
 
-    async_add_entities([GitOpsLocalChangesUpdate(coordinator)])
 
-
-class GitOpsLocalChangesUpdate(UpdateEntity):
-    """Update entity for local uncommitted changes."""
+class GitOpsConfigUpdate(UpdateEntity):
+    """Update entity that tracks remote git commits available to deploy."""
 
     _attr_has_entity_name = True
-    _attr_name = "Sync Status"
-    _attr_unique_id = "gitops_local_changes"
-    _attr_icon = "mdi:sync"
+    _attr_name = "Configuration"
+    _attr_unique_id = "gitops_config_update"
+    _attr_icon = "mdi:source-branch-sync"
     _attr_supported_features = (
-        UpdateEntityFeature.INSTALL
-        | UpdateEntityFeature.RELEASE_NOTES
+        UpdateEntityFeature.INSTALL | UpdateEntityFeature.RELEASE_NOTES
     )
 
     def __init__(self, coordinator: GitOpsCoordinator) -> None:
@@ -53,138 +51,75 @@ class GitOpsLocalChangesUpdate(UpdateEntity):
         """Register callbacks."""
         self.async_on_remove(
             async_dispatcher_connect(
-                self.hass,
-                f"{DOMAIN}_update",
-                self._handle_coordinator_update,
+                self.hass, f"{DOMAIN}_update", self._handle_update,
             )
         )
 
     @callback
-    def _handle_coordinator_update(self) -> None:
+    def _handle_update(self) -> None:
         """Handle updated data from the coordinator."""
         self.async_write_ha_state()
 
     @property
     def installed_version(self) -> str | None:
-        """Return the current commit SHA."""
-        if self.coordinator._repo:
-            return self.coordinator._repo.head.commit.hexsha[:7]
-        return None
+        """Return the current local commit SHA."""
+        return self.coordinator.git_state.local_sha
 
     @property
     def latest_version(self) -> str | None:
-        """Return '<sha>-dirty' if there are uncommitted changes, otherwise current commit."""
-        if not self.coordinator._repo:
-            return None
-
-        if self.coordinator._repo.is_dirty() or self.coordinator._repo.untracked_files:
-            current_sha = self.coordinator._repo.head.commit.hexsha[:7]
-            return f"{current_sha}-dirty"
-
+        """Return the remote commit SHA if an update is available."""
+        state = self.coordinator.git_state
+        if state.update_available and state.remote_sha:
+            return state.remote_sha
         return self.installed_version
 
     @property
     def release_url(self) -> str | None:
-        """Return URL for release notes."""
+        """Return GitHub compare URL between local and remote."""
+        state = self.coordinator.git_state
+        repo_url = self.coordinator.get_repo_url()
+        if repo_url and state.local_sha and state.remote_sha and state.update_available:
+            return f"{repo_url}/compare/{state.local_sha}...{state.remote_sha}"
         return None
 
     async def async_release_notes(self) -> str | None:
-        """Return the release notes (git diff)."""
-        if not self.coordinator._repo:
+        """Return commit log as markdown release notes."""
+        state = self.coordinator.git_state
+        if not state.commit_log:
             return None
 
-        if not self.coordinator._repo.is_dirty() and not self.coordinator._repo.untracked_files:
-            return None
+        count = state.commits_behind
+        lines = [f"### {count} new commit{'s' if count != 1 else ''}\n"]
 
-        # Get diff of modified files
-        diff_lines = []
+        for entry in state.commit_log:
+            sha = entry["sha"]
+            msg = entry["message"]
+            author = entry.get("author", "")
+            lines.append(f"- **`{sha}`** {msg}")
 
-        # Show modified files
-        if self.coordinator._repo.is_dirty():
-            diff = self.coordinator._repo.git.diff()
-            if diff:
-                # Split diff by file
-                file_diffs = diff.split('diff --git')
-                for file_diff in file_diffs:
-                    if not file_diff.strip():
-                        continue
+        deploy_state = self.coordinator.deployment_state
+        if deploy_state.status not in ("idle", "success"):
+            lines.append(f"\n*Last deploy: {deploy_state.status}*")
+            if deploy_state.error:
+                lines.append(f"*Error: {deploy_state.error}*")
 
-                    # Extract filename from diff header
-                    lines = file_diff.split('\n')
-                    filename = "Unknown file"
-                    for line in lines[:5]:
-                        if line.startswith(' a/') or line.startswith(' b/'):
-                            filename = line.split('/', 1)[1] if '/' in line else filename
-                            break
+        return "\n".join(lines)
 
-                    diff_lines.append(f"<details><summary><b>{filename}</b></summary>\n")
-                    diff_lines.append("```diff")
-                    diff_lines.append("diff --git" + file_diff)
-                    diff_lines.append("```")
-                    diff_lines.append("</details>\n")
-
-        # Show untracked files with contents
-        if self.coordinator._repo.untracked_files:
-            diff_lines.append("## Untracked Files\n")
-            for file in self.coordinator._repo.untracked_files:
-                try:
-                    # Read file content
-                    file_path = Path(self.coordinator._repo.working_dir) / file
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-
-                    # Determine file extension for syntax highlighting
-                    ext = file_path.suffix.lstrip('.')
-                    if ext in ['py', 'yaml', 'yml', 'json', 'js', 'ts', 'sh', 'bash']:
-                        lang = ext if ext != 'yml' else 'yaml'
-                    else:
-                        lang = ''
-
-                    # Show file with content in collapsible section
-                    diff_lines.append(f"<details><summary><b>{file}</b> (new file)</summary>\n")
-                    diff_lines.append(f"```{lang}")
-                    diff_lines.append(content)
-                    diff_lines.append("```")
-                    diff_lines.append("</details>\n")
-                except Exception as e:
-                    # If we can't read the file, just show the name
-                    diff_lines.append(f"- `{file}` (binary or unreadable)\n")
-
-        return "\n".join(diff_lines) if diff_lines else "No changes detected"
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Return additional attributes."""
+        state = self.coordinator.git_state
+        deploy = self.coordinator.deployment_state
+        return {
+            "commits_behind": state.commits_behind,
+            "last_check": state.last_check.isoformat() if state.last_check else None,
+            "remote_message": state.remote_message,
+            "deploy_status": deploy.status,
+            "deploy_timestamp": deploy.timestamp.isoformat() if deploy.timestamp else None,
+        }
 
     async def async_install(
         self, version: str | None, backup: bool, **kwargs
     ) -> None:
-        """Commit and push local changes."""
-        if not self.coordinator._repo:
-            raise Exception("Git repository not initialized")
-
-        repo = self.coordinator._repo
-
-        # Stage all changes
-        repo.git.add(A=True)
-
-        # Create commit message
-        modified = [item.a_path for item in repo.index.diff("HEAD")]
-        untracked = repo.untracked_files
-
-        commit_msg_parts = ["Update Home Assistant configuration"]
-
-        if modified:
-            commit_msg_parts.append(f"\nModified files: {', '.join(modified)}")
-        if untracked:
-            commit_msg_parts.append(f"\nNew files: {', '.join(untracked)}")
-
-        commit_msg_parts.append("\n\n✨ Committed via GitOps integration")
-
-        # Commit
-        repo.index.commit("\n".join(commit_msg_parts))
-
-        # Push
-        origin = repo.remote("origin")
-        origin.push()
-
-        _LOGGER.info("Committed and pushed local changes")
-
-        # Update state
-        self.async_write_ha_state()
+        """Deploy the latest configuration."""
+        await self.coordinator.async_deploy()

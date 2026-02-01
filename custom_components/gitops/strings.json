@@ -3,22 +3,18 @@
     "step": {
       "user": {
         "title": "Set up GitOps",
-        "description": "Configure GitOps deployment webhook and Infisical secrets management. The webhook secret will be automatically fetched from Infisical or generated if not found.",
+        "description": "Create a [service token](https://docs.doppler.com/docs/service-tokens) in Doppler scoped to your project/config for secrets access.\n\nThe integration will poll Git for new commits and show them as available updates.",
         "data": {
-          "webhook_id": "Webhook ID",
-          "infisical_url": "Infisical Server URL",
-          "infisical_client_id": "Infisical Client ID",
-          "infisical_client_secret": "Infisical Client Secret",
-          "infisical_project_id": "Infisical Project ID",
-          "infisical_environment": "Infisical Environment",
-          "infisical_path": "Infisical Path",
+          "doppler_service_token": "Doppler Service Token",
+          "doppler_api_url": "Doppler API URL",
+          "update_check_interval": "Update Check Interval (seconds)",
           "enable_drift_detection": "Enable Drift Detection",
           "drift_check_interval": "Drift Check Interval (seconds)"
         }
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to Infisical: {error}",
+      "cannot_connect": "Failed to connect to Doppler: {error}",
       "unknown": "An unexpected error occurred: {error}"
     },
     "abort": {
@@ -30,40 +26,51 @@
       "init": {
         "title": "GitOps Options",
         "data": {
+          "update_check_interval": "Update Check Interval (seconds)",
           "enable_drift_detection": "Enable Drift Detection",
           "drift_check_interval": "Drift Check Interval (seconds)"
         }
       }
     }
   },
+  "services": {
+    "deploy": {
+      "name": "Deploy",
+      "description": "Pull latest configuration from Git, sync secrets, validate, and reload changed components."
+    },
+    "check_updates": {
+      "name": "Check for updates",
+      "description": "Fetch from Git remote and check for available commits."
+    }
+  },
   "issues": {
     "git_lock_detected": {
       "title": "Git Lock File Detected",
-      "description": "A git lock file was detected at `.git/index.lock`. This usually indicates a previous git operation was interrupted (e.g., by a crash). To resolve, you can remove the lock file manually via SSH or the File Editor addon:\n\n```bash\nrm /config/.git/index.lock\n```\n\nAfter removing the lock file, retry the deployment."
+      "description": "A git lock file was detected at `.git/index.lock`. Remove it to resume deployments:\n```bash\nrm /config/.git/index.lock\n```"
     },
     "restart_required": {
       "title": "Home Assistant Restart Required",
-      "description": "Deployment of commit `{commit}` completed successfully, but changes require a Home Assistant restart to take effect.\n\nCommit message: {message}\n\nPlease restart Home Assistant when convenient."
+      "description": "Commit `{commit}` deployed, but changes require a restart.\n\n{message}"
     },
-    "infisical_connection_failed": {
-      "title": "Infisical Connection Failed",
-      "description": "Failed to connect to Infisical server: {error}\n\nSecrets synchronization is disabled until the connection is restored. Check your Infisical configuration and network connectivity."
+    "doppler_connection_failed": {
+      "title": "Doppler Connection Failed",
+      "description": "Failed to connect to Doppler: {error}\n\nSecrets sync is disabled until restored."
     },
-    "infisical_sync_failed": {
-      "title": "Infisical Secret Sync Failed",
-      "description": "Failed to synchronize secrets from Infisical: {error}\n\nThis may cause issues with configurations that depend on secrets. The integration will retry automatically."
+    "doppler_sync_failed": {
+      "title": "Doppler Sync Failed",
+      "description": "Failed to sync secrets: {error}"
     },
     "git_connection_failed": {
       "title": "Git Repository Connection Failed",
-      "description": "Failed to initialize git repository: {error}\n\nDeployments are disabled until the git repository is accessible."
+      "description": "Failed to initialize git repository: {error}"
     },
     "deployment_interrupted": {
       "title": "Previous Deployment Interrupted",
-      "description": "A deployment that started at {timestamp} (commit: {commit}) did not complete, likely due to a Home Assistant crash or restart.\n\nPlease check the system logs and current configuration state. You may need to manually verify the deployment or trigger a new one."
+      "description": "A deployment started at {timestamp} (commit: {commit}) did not complete."
     },
     "integration_needs_reload": {
       "title": "GitOps Integration Updated",
-      "description": "The GitOps integration was updated from commit {old_version} to {new_version}.\n\nTo apply the changes, please reload the integration:\n1. Go to Settings → Devices & Services\n2. Find GitOps integration\n3. Click the three dots menu → Reload\n\nAlternatively, restart Home Assistant to fully reload the integration."
+      "description": "Updated from {old_version} to {new_version}. Reload via Settings → Devices & Services → GitOps."
     }
   }
 }

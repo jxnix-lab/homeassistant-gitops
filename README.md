@@ -4,354 +4,165 @@
 [![GitHub Release](https://img.shields.io/github/release/jxnix-lab/homeassistant-gitops.svg)](https://github.com/jxnix-lab/homeassistant-gitops/releases)
 [![License](https://img.shields.io/github/license/jxnix-lab/homeassistant-gitops.svg)](LICENSE)
 
-Bring modern GitOps principles to Home Assistant! This integration enables automated configuration deployments triggered by Git pushes, with intelligent component reloading, comprehensive deployment tracking, and real-time status updates.
+GitOps-style configuration management for Home Assistant. Polls your Git repository for new commits, shows them as available updates (like HACS), and deploys with smart component reloading when you're ready.
+
+## How It Works
+
+1. **You push** configuration changes to your Git repo
+2. **GitOps polls** (or receives a webhook) and detects new commits
+3. **Update appears** in the HA UI — just like HACS shows pending updates
+4. **You deploy** by clicking "Install" in the UI, or via the `gitops.deploy` service call
+5. **Smart reload** — only changed components are reloaded, no unnecessary restarts
+
+No GitHub Actions runner required. No CI/CD pipeline. Just Git and Home Assistant.
 
 ## Features
 
-### Core Functionality
-- **🚀 Automated Git-based Deployments** - Push to your Git repository and watch configurations deploy automatically
-- **🔒 Secure Webhook Integration** - HMAC-SHA256 signature verification for secure deployments
-- **🎯 Smart Component Reloading** - Automatically detects which components changed and reloads only those
-- **📊 Real-time Deployment Tracking** - SSE streaming of deployment progress back to GitHub Actions
-- **⚡ Crash Recovery** - Detects interrupted deployments and creates repair issues
-- **🔄 Configuration Drift Detection** - Periodic checks for uncommitted local changes
-
-### Deployment Intelligence
-- **Selective Reloading** - Automatically reloads automations, scripts, groups, scenes, and more based on changed files
-- **Restart Detection** - Identifies when configuration changes require a full Home Assistant restart
-- **Validation** - Runs `ha core check` before reloading to catch configuration errors
-- **Rollback Support** - Failed deployments don't apply changes, maintaining system stability
-
-### Optional Features
-- **🔐 Infisical Integration** - Sync secrets from Infisical secrets manager (BETA)
-- **📈 Deployment Sensors** - Track current commit SHA, deployment status, git status, and drift status
-- **🔔 GitHub Actions Integration** - Seamlessly integrates with GitHub Actions for CI/CD workflows
+- **HACS-style updates** — New commits show as available updates with commit log
+- **Smart reloading** — Only reloads automations, scripts, groups, etc. that actually changed
+- **Config validation** — Runs `ha core check` before applying changes
+- **Doppler secrets sync** — Automatically syncs secrets on startup and each deploy
+- **Service calls** — `gitops.deploy` and `gitops.check_updates` for automation and agents
+- **Webhooks** — Optional push notifications from GitHub for instant detection
+- **Drift detection** — Detects uncommitted local changes (UI edits, manual tweaks)
+- **Crash recovery** — Detects interrupted deployments on restart
 
 ## Installation
 
 ### HACS (Recommended)
 
-1. Open HACS in your Home Assistant instance
-2. Click on "Integrations"
-3. Click the three dots menu in the top right and select "Custom repositories"
-4. Add `https://github.com/jxnix-lab/homeassistant-gitops` as an integration repository
-5. Click "Install" on the GitOps integration
-6. Restart Home Assistant
+1. HACS → Integrations → ⋮ → Custom repositories
+2. Add `https://github.com/jxnix-lab/homeassistant-gitops` as integration
+3. Install → Restart HA
 
-### Manual Installation
+### Manual
 
-1. Copy the `custom_components/gitops` folder to your Home Assistant `config/custom_components/` directory
-2. Restart Home Assistant
-3. Go to Settings → Devices & Services → Add Integration
-4. Search for "GitOps" and follow the configuration flow
+Copy `custom_components/gitops/` to `config/custom_components/` and restart.
 
 ## Prerequisites
 
-### 1. Git Repository Setup
+### Git Repository
 
-Your Home Assistant configuration must be managed in a Git repository:
+Your HA config directory must be a Git repo with an SSH remote:
 
 ```bash
 cd /config
 git init
-git remote add origin <your-repo-url>
-git add .
-git commit -m "Initial commit"
-git push -u origin main
-```
-
-**SSH Authentication (Recommended):**
-
-For automated deployments, configure SSH key authentication:
-
-```bash
-# Generate SSH key on Home Assistant
+git remote add origin git@github.com:you/your-ha-config.git
 ssh-keygen -t ed25519 -f /config/.ssh/id_ed25519 -N ""
-
-# Add public key to GitHub
-cat /config/.ssh/id_ed25519.pub
-# Copy the output and add as a deploy key in GitHub repo settings
-
-# Configure git to use SSH
-git remote set-url origin git@github.com:your-username/your-repo.git
+# Add public key as deploy key in GitHub repo settings
+git add . && git commit -m "Initial" && git push -u origin main
 ```
 
-### 2. GitHub Actions Workflow (Optional but Recommended)
+### Doppler Service Token
 
-Create `.github/workflows/deploy.yml` in your repository:
+[Create a service token](https://docs.doppler.com/docs/service-tokens) scoped to your project and config. This gives the integration read-only access to sync secrets into `secrets_doppler.yaml`.
 
-```yaml
-name: Deploy Home Assistant Config
+## Setup
 
-on:
-  push:
-    branches: [main]
+Settings → Devices & Services → Add Integration → **GitOps**
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Trigger GitOps Deployment
-        env:
-          WEBHOOK_SECRET: ${{ secrets.GITOPS_WEBHOOK_SECRET }}
-        run: |
-          COMMIT_MSG="$(git log -1 --pretty=%s)"
-          COMMIT_SHA="$(git rev-parse --short HEAD)"
-
-          # Create signed payload
-          PAYLOAD=$(jq -cn \
-            --arg ref "${{ github.ref }}" \
-            --arg after "${{ github.sha }}" \
-            --arg repo "${{ github.repository }}" \
-            --arg message "$COMMIT_MSG" \
-            --arg id "$COMMIT_SHA" \
-            '{"ref":$ref,"after":$after,"repository":{"full_name":$repo},"head_commit":{"message":$message,"id":$id}}')
-
-          # Calculate HMAC signature
-          SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | sed 's/^.* //')
-
-          # Call webhook
-          curl -X POST \
-            -H "Content-Type: application/json" \
-            -H "X-Hub-Signature-256: sha256=$SIGNATURE" \
-            -H "X-GitHub-Event: push" \
-            -d "$PAYLOAD" \
-            http://your-home-assistant:8123/api/webhook/gitops-deploy
-```
-
-Add `GITOPS_WEBHOOK_SECRET` to your GitHub repository secrets.
-
-## Configuration
-
-### Basic Setup
-
-1. Go to Settings → Devices & Services → Add Integration
-2. Search for "GitOps"
-3. Configure the integration:
-   - **Webhook ID**: `gitops-deploy` (or custom ID)
-   - **Infisical URL**: Leave default unless using self-hosted Infisical
-   - **Infisical Client ID**: (Optional) For secrets management
-   - **Infisical Client Secret**: (Optional) For secrets management
-   - **Enable Drift Detection**: Enable to detect local configuration changes
-   - **Drift Check Interval**: How often to check for drift (default: 300 seconds)
-
-### Configuration Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| Webhook ID | Unique identifier for the deployment webhook | `gitops-deploy` |
-| Webhook Secret | HMAC secret for signature verification | Auto-generated |
-| Infisical URL | Infisical server URL (optional) | `https://app.infisical.com` |
-| Infisical Client ID | Universal Auth client ID (optional) | - |
-| Infisical Client Secret | Universal Auth client secret (optional) | - |
-| Enable Drift Detection | Detect uncommitted local changes | `false` |
+| Field | Description | Default |
+|-------|-------------|---------|
+| Doppler Service Token | `dp.st.xxx` scoped to your project/config | — |
+| Doppler API URL | Override for self-hosted Doppler | `https://api.doppler.com` |
+| Update Check Interval | Seconds between git fetch polls | `300` (5 min) |
+| Enable Drift Detection | Check for uncommitted local changes | `false` |
 | Drift Check Interval | Seconds between drift checks | `300` |
 
 ## Usage
 
-### Webhook Endpoint
+### Update Entity
 
-Once configured, the integration creates a webhook endpoint:
+When new commits are detected, the update entity shows:
 
-```
-http://your-home-assistant:8123/api/webhook/gitops-deploy
-```
+- Current version (local commit SHA)
+- Available version (remote commit SHA)
+- Release notes (commit log with messages)
+- "Install" button to deploy
 
-**Webhook Payload** (GitHub-compatible):
+Works exactly like HACS updates in the HA dashboard.
 
-```json
-{
-  "ref": "refs/heads/main",
-  "after": "commit-sha",
-  "repository": {
-    "full_name": "username/repo"
-  },
-  "head_commit": {
-    "message": "Update configuration",
-    "id": "short-sha"
-  }
-}
+### Service Calls
+
+```yaml
+# Deploy latest (pull → secrets sync → validate → reload)
+service: gitops.deploy
+
+# Check for new commits now (don't wait for next poll)
+service: gitops.check_updates
 ```
 
-**Security**: The webhook validates HMAC-SHA256 signatures using the `X-Hub-Signature-256` header.
+Use `gitops.deploy` in automations, scripts, or have your AI assistant call it.
+
+### Webhooks
+
+Two lightweight webhooks are registered automatically:
+
+| Webhook | Purpose |
+|---------|---------|
+| `gitops-notify` | Triggers immediate update check (set this as a GitHub repo webhook) |
+| `gitops-secrets-refresh` | Triggers Doppler secrets re-sync |
+
+To get instant push detection, add a GitHub webhook (repo settings → Webhooks) pointing to:
+```
+https://your-ha-instance/api/webhook/gitops-notify
+```
+No secret needed — worst case someone triggers an extra `git fetch`.
+
+### Sensors
+
+- **`sensor.gitops_deployment_status`** — Last deploy result (idle/deploying/success/failed)
+- **`sensor.gitops_current_commit`** — Current commit SHA, commits behind, update available
+
+### Secrets Sync
+
+On startup and each deploy, secrets from Doppler are written to `/config/secrets_doppler.yaml` and automatically included in `secrets.yaml`. Reference them as `!secret SECRET_NAME`.
 
 ### Deployment Flow
 
-1. **Push to Git** - Push configuration changes to your repository
-2. **GitHub Actions Trigger** - Workflow sends signed webhook to Home Assistant
-3. **Webhook Handler** - Integration validates signature and starts deployment
-4. **Git Pull** - Fetches latest changes from repository
-5. **Validation** - Runs `ha core check` to validate configuration
-6. **Smart Reload** - Identifies changed files and reloads appropriate components
-7. **Status Update** - Streams progress back via SSE (Server-Sent Events)
+1. Git pull (fetch new config files)
+2. Doppler sync (refresh secrets — new config may reference new secrets)
+3. Validate (`ha core check`)
+4. Smart reload (only changed components)
+5. If core config changed → repair issue prompting restart
 
-### Smart Component Reloading
+### Smart Reloading
 
-The integration automatically reloads components based on changed files:
-
-| Files Changed | Components Reloaded |
-|---------------|---------------------|
+| Changed Files | Reloaded |
+|---------------|----------|
 | `automations.yaml` | Automations |
 | `scripts.yaml` | Scripts |
 | `groups.yaml` | Groups |
 | `scenes.yaml` | Scenes |
-| `configuration.yaml` | Multiple (group, template, input_*) |
+| `configuration.yaml` | Groups, templates, inputs (+ restart prompt) |
 
-**Restart Required**: Changes to `configuration.yaml`, `customize.yaml`, or `packages/*.yaml` will trigger a repair issue prompting for a manual restart.
+## Migrating from v1
 
-### Sensors
+v2 replaces Infisical with Doppler and removes the GitHub Actions dependency.
 
-The integration provides several sensors for monitoring:
-
-- **`sensor.gitops_current_commit`** - Current deployed commit SHA and message
-- **`sensor.gitops_latest_deployment`** - Last deployment timestamp and status
-- **`sensor.gitops_git_status`** - Git repository status (clean, uncommitted changes, etc.)
-- **`sensor.gitops_drift_status`** - Configuration drift status (enabled if drift detection is on)
-
-### Update Entity
-
-The integration creates an update entity that tracks when the integration itself has been updated. After updating the integration code via `git pull`, a repair issue will prompt you to reload the integration.
-
-## Advanced Features
-
-### Infisical Secrets Management (BETA)
-
-The integration can sync secrets from Infisical and make them available to Home Assistant:
-
-1. **Configure Infisical**:
-   - Set up Universal Auth in Infisical
-   - Get Client ID and Client Secret
-   - Configure project ID, environment, and path
-
-2. **Secrets Sync**:
-   - Secrets are automatically synced on deployment
-   - Written to `/config/secrets_infisical.yaml`
-   - Automatically included in `/config/secrets.yaml`
-
-3. **Webhook for Manual Refresh**:
-   - Endpoint: `/api/webhook/gitops-secrets-refresh`
-   - Manually trigger secrets sync via webhook
-
-**Note**: Infisical integration is optional and in beta. The integration works perfectly without it.
-
-### Drift Detection
-
-When enabled, drift detection periodically checks for uncommitted local changes:
-
-- Runs `git status` on configured interval
-- Creates repair issues when drift is detected
-- Helps identify UI-created automations or manual file edits
-- Useful for keeping Git as the source of truth
+1. Update the integration files
+2. Remove the existing GitOps config entry
+3. Re-add with your Doppler service token
+4. `secrets.yaml` will automatically update its include from `secrets_infisical.yaml` to `secrets_doppler.yaml`
+5. Delete `/config/secrets_infisical.yaml` after verifying
+6. The GitHub Actions deploy workflow is no longer needed — you can remove it
 
 ## Troubleshooting
 
-### Git Lock File Detected
+**Git lock file** — `rm /config/.git/index.lock`
 
-If a deployment is interrupted (crash, restart), a git lock file may remain. The integration will create a repair issue with instructions to remove it:
+**Doppler connection** — Check token validity, network access to `api.doppler.com`
 
-```bash
-rm /config/.git/index.lock
-```
+**SSH issues** — Verify key exists at `/config/.ssh/id_ed25519`, test with `ssh -T git@github.com`
 
-### Deployment Failed
-
-Check the sensor attributes for error details:
-
+**Debug logging:**
 ```yaml
-state: failed
-attributes:
-  error: "Git pull failed: ..."
-  timestamp: "2024-01-01T12:00:00Z"
+logger:
+  logs:
+    custom_components.gitops: debug
 ```
-
-Common issues:
-- SSH key not configured or expired
-- Network connectivity to Git repository
-- Merge conflicts in local repository
-- Invalid YAML syntax
-
-### SSH Authentication Issues
-
-Verify SSH key setup:
-
-```bash
-# Check if key exists
-ls -la /config/.ssh/id_ed25519
-
-# Test GitHub connection
-ssh -T git@github.com
-
-# Verify git remote
-git remote -v
-```
-
-### Component Reload Issues
-
-If a component doesn't reload automatically:
-- Check the `RELOAD_PATTERNS` in integration code
-- Manually reload via Developer Tools → YAML → Reload (specific component)
-- Check Home Assistant logs for errors
-
-## Development
-
-### Project Structure
-
-```
-homeassistant-gitops/
-├── custom_components/
-│   └── gitops/
-│       ├── __init__.py          # Integration setup
-│       ├── config_flow.py       # Configuration UI
-│       ├── const.py             # Constants and defaults
-│       ├── coordinator.py       # Core deployment logic
-│       ├── sensor.py            # Sensor entities
-│       ├── update.py            # Update entity
-│       ├── manifest.json        # Integration manifest
-│       ├── strings.json         # UI strings
-│       └── translations/
-│           └── en.json          # English translations
-├── hacs.json                    # HACS manifest
-├── info.md                      # HACS store description
-├── README.md                    # This file
-└── LICENSE                      # License file
-```
-
-### Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
-
-### Testing
-
-Test the integration in your development environment:
-
-1. Copy to `custom_components/gitops/`
-2. Restart Home Assistant
-3. Enable debug logging:
-   ```yaml
-   logger:
-     default: info
-     logs:
-       custom_components.gitops: debug
-   ```
-4. Check logs for detailed operation
-
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/jxnix-lab/homeassistant-gitops/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/jxnix-lab/homeassistant-gitops/discussions)
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-Built with ❤️ for the Home Assistant community. Inspired by modern GitOps practices and the need for better configuration management in Home Assistant.
+MIT — see [LICENSE](LICENSE).
